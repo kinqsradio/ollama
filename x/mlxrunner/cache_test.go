@@ -823,8 +823,8 @@ func TestEvictionPreservesActiveConversations(t *testing.T) {
 		kvc.enforceEvictionPolicy()
 
 		// Memory should be within limits.
-		if kvc.pagedOutBytes > maxPagedOutBytes {
-			t.Fatalf("pagedOutBytes = %d, want <= %d", kvc.pagedOutBytes, maxPagedOutBytes)
+		if kvc.pagedOutBytes > kvc.snapshotBudget() {
+			t.Fatalf("pagedOutBytes = %d, want <= %d", kvc.pagedOutBytes, kvc.snapshotBudget())
 		}
 
 		// Active path should be untouched.
@@ -839,6 +839,60 @@ func TestEvictionPreservesActiveConversations(t *testing.T) {
 			t.Fatalf("system prompt match = %d, want %d", matched, len(systemPrompt))
 		}
 
+		checkTrieInvariants(t, kvc.root)
+	})
+}
+
+func TestSnapshotBudget(t *testing.T) {
+	c := &kvCache{}
+	if got := c.snapshotBudget(); got != defaultSnapshotBudget {
+		t.Errorf("default snapshotBudget = %d, want %d", got, defaultSnapshotBudget)
+	}
+	c.budget = 3 << 30
+	if got := c.snapshotBudget(); got != 3<<30 {
+		t.Errorf("custom snapshotBudget = %d, want %d", got, int64(3<<30))
+	}
+}
+
+// TestSetBudgetTriggersEviction verifies that lowering the budget evicts
+// non-active snapshots while preserving the active conversation.
+func TestSetBudgetTriggersEviction(t *testing.T) {
+	forEachEnv(t, func(t *testing.T, env *testEnv) {
+		kvc := env.kvc
+		systemPrompt := []int32{1, 2, 3, 4, 5}
+		for i := range 5 {
+			suffix := []int32{int32(100 + i*10), int32(101 + i*10), int32(102 + i*10)}
+			inputs := append(slices.Clone(systemPrompt), suffix...)
+			simulateRequest(t, kvc, inputs, []int32{int32(200 + i)})
+		}
+		// Give every snapshot a measurable size so eviction frees real bytes.
+		walkNodes(kvc.root, func(n *trieNode) bool {
+			if !n.hasSnapshots() {
+				return true
+			}
+			snaps := make([]cache.Snapshot, len(n.snapshots))
+			for i, s := range n.snapshots {
+				if s != nil {
+					snaps[i] = &fakeSnapshot{byteSize: 256 << 20}
+				}
+			}
+			n.setSnapshots(snaps, &kvc.pagedOutBytes)
+			return true
+		})
+
+		before := kvc.pagedOutBytes
+		if before == 0 {
+			t.Skip("no snapshots to evict")
+		}
+		// A budget below the total forces eviction of every non-active snapshot.
+		kvc.setBudget(1)
+
+		if kvc.pagedOutBytes >= before {
+			t.Fatalf("setBudget(1) did not evict: before=%d after=%d", before, kvc.pagedOutBytes)
+		}
+		if _, matched := findBestMatch(kvc.root, systemPrompt); matched < len(systemPrompt) {
+			t.Fatalf("active conversation lost after eviction (systemPrompt matched=%d)", matched)
+		}
 		checkTrieInvariants(t, kvc.root)
 	})
 }

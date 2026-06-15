@@ -29,13 +29,31 @@ import (
 	"github.com/ollama/ollama/x/mlxrunner/model/base"
 )
 
-const maxPagedOutBytes int64 = 8 << 30 // 8 GiB eviction threshold for paged-out snapshot memory
+// defaultSnapshotBudget caps paged-out snapshot memory when no host-aware budget
+// has been set (see kvCache.setBudget and planSnapshotBudget).
+const defaultSnapshotBudget int64 = 8 << 30 // 8 GiB
 
 type kvCache struct {
 	root          *trieNode   // root of the prefix trie
 	activePath    []*trieNode // current root→leaf path with live MLX arrays
 	caches        []cache.Cache
 	pagedOutBytes int64 // total bytes in paged-out snapshots across the trie
+	budget        int64 // snapshot eviction threshold (0 = defaultSnapshotBudget)
+}
+
+// snapshotBudget is the current eviction ceiling for paged-out snapshot memory.
+func (c *kvCache) snapshotBudget() int64 {
+	if c.budget > 0 {
+		return c.budget
+	}
+	return defaultSnapshotBudget
+}
+
+// setBudget sets the snapshot eviction ceiling and enforces it immediately, so
+// lowering the budget evicts down to the new ceiling.
+func (c *kvCache) setBudget(b int64) {
+	c.budget = b
+	c.enforceEvictionPolicy()
 }
 
 // pendingSnapshot is a snapshot scheduled to be taken during prefill.
@@ -504,7 +522,8 @@ func (s *cacheSession) close() {
 
 // enforceEvictionPolicy evicts eligible nodes until paged-out memory is within limits.
 func (c *kvCache) enforceEvictionPolicy() {
-	if c.pagedOutBytes <= maxPagedOutBytes {
+	budget := c.snapshotBudget()
+	if c.pagedOutBytes <= budget {
 		return
 	}
 
@@ -513,7 +532,7 @@ func (c *kvCache) enforceEvictionPolicy() {
 		activeSet[n] = true
 	}
 
-	for c.pagedOutBytes > maxPagedOutBytes {
+	for c.pagedOutBytes > budget {
 		var best *trieNode
 		walkNodes(c.root, func(n *trieNode) bool {
 			if n == c.root || activeSet[n] || len(n.children) > 1 {

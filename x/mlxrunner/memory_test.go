@@ -30,3 +30,27 @@ func TestPlanCache(t *testing.T) {
 		})
 	}
 }
+
+func TestPlanSnapshotBudget(t *testing.T) {
+	const floor int64 = 512 << 20
+	cases := []struct {
+		name            string
+		modelSize, free int
+		want            int64
+	}{
+		{"unknown free keeps default", 14 * gib, 0, defaultSnapshotBudget},
+		{"model overflows free floors", 14 * gib, 10 * gib, floor},
+		{"comfortable caps at default", 4 * gib, 64 * gib, defaultSnapshotBudget},
+		// free=16 GiB -> reserve 3.2 GiB; 16-8-3.2 = 4.8 GiB.
+		{"constrained scales to host", 8 * gib, 16 * gib, int64(16*gib - 8*gib - 16*gib/5)},
+		// 16-12-3.2 = 0.8 GiB, still above the floor.
+		{"just above floor", 12 * gib, 16 * gib, int64(16*gib - 12*gib - 16*gib/5)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := planSnapshotBudget(tc.modelSize, tc.free); got != tc.want {
+				t.Errorf("planSnapshotBudget(%d, %d) = %d, want %d", tc.modelSize, tc.free, got, tc.want)
+			}
+		})
+	}
+}

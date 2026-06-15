@@ -80,6 +80,48 @@ func tuneMLXMemory(startupFree int) {
 	}
 }
 
+// planSnapshotBudget sizes the prompt cache's paged-out snapshot eviction ceiling
+// to the host. Snapshots are pinned resident MLX arrays, so when the model already
+// fills RAM they must not grow the default 8 GiB on top of it. The budget is the
+// free RAM left after the model and a one-fifth reserve for activations/KV/cache,
+// floored so prefix reuse stays useful and capped at the default ceiling.
+func planSnapshotBudget(modelSize, startupFree int) int64 {
+	const floor int64 = 512 << 20 // 512 MiB
+	if startupFree <= 0 {
+		return defaultSnapshotBudget
+	}
+	avail := int64(startupFree - modelSize - startupFree/5)
+	switch {
+	case avail < floor:
+		return floor
+	case avail > defaultSnapshotBudget:
+		return defaultSnapshotBudget
+	default:
+		return avail
+	}
+}
+
+// snapshotBudgetOverride reads OLLAMA_MLX_SNAPSHOT_BUDGET (bytes); returns 0 when
+// unset or invalid, letting planSnapshotBudget decide.
+func snapshotBudgetOverride() int64 {
+	n, err := strconv.ParseInt(os.Getenv("OLLAMA_MLX_SNAPSHOT_BUDGET"), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// configureSnapshotBudget sizes the prompt-cache snapshot eviction ceiling to the
+// host once the model is loaded. Must run on the MLX thread (reads ActiveMemory).
+func configureSnapshotBudget(c *kvCache, startupFree int) {
+	budget := planSnapshotBudget(mlx.ActiveMemory(), startupFree)
+	if env := snapshotBudgetOverride(); env > 0 {
+		budget = env
+	}
+	c.setBudget(budget)
+	slog.Info("MLX prompt-cache snapshot budget", "budget", format.HumanBytes2(uint64(budget)))
+}
+
 func Execute(args []string) error {
 	slog.SetDefault(logutil.NewLogger(os.Stderr, envconfig.LogLevel()))
 
@@ -130,6 +172,7 @@ func Execute(args []string) error {
 			return err
 		}
 		tuneMLXMemory(startupFree)
+		configureSnapshotBudget(&runner.cache, startupFree)
 		return nil
 	}); err != nil {
 		return err
